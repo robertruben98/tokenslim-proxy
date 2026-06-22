@@ -8,12 +8,12 @@ forwarding to the real provider, preserving your auth headers.
 
 Built on **FastAPI + httpx**.
 
-## Routes (M0 foundation)
+## Routes
 
 | Method | Path | Behavior |
 | --- | --- | --- |
-| `POST` | `/v1/messages` | Compress + forward to `api.anthropic.com`. |
-| `POST` | `/v1/chat/completions` | Compress + forward to `api.openai.com`. |
+| `POST` | `/v1/messages` | Compress + forward to `api.anthropic.com` (streams when `stream:true`). |
+| `POST` | `/v1/chat/completions` | Compress + forward to `api.openai.com` (streams when `stream:true`). |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/healthz/upstream` | Resolved upstream config (no network call). |
 | `GET` | `/metrics` | Prometheus text exposition of compression counters. |
@@ -47,6 +47,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 | `TOKENSLIM_PROXY_OPENAI_BASE` | `https://api.openai.com` | OpenAI upstream. |
 | `TOKENSLIM_PROXY_UPSTREAM_TIMEOUT` | `60` | Per-request timeout (s). |
 | `TOKENSLIM_PROXY_COMPRESSION` | `1` | Master on/off switch. |
+| `TOKENSLIM_PROXY_CACHE_PREFIX_STABLE` | `1` | Compress each message in isolation so the already-sent prefix stays byte-stable across turns. |
+| `TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT` | `0` | Insert an Anthropic `cache_control` breakpoint at the prefix boundary (opt-in). |
 
 ## How it works
 
@@ -54,9 +56,27 @@ Both `/v1/messages` and `/v1/chat/completions` carry a `messages` array. On each
 request the proxy parses the JSON body, runs that array through the core
 `compress()`, re-serializes, and forwards to the configured upstream — relaying
 all headers except hop-by-hop / length / encoding ones, so `authorization`,
-`x-api-key` and `anthropic-version` are preserved. The response is streamed back
-with transport headers stripped. Non-`messages` fields (model, tools, system,
-temperature…) are passed through untouched.
+`x-api-key` and `anthropic-version` are preserved. Non-`messages` fields (model,
+tools, system, temperature…) are passed through untouched.
+
+### Streaming (SSE)
+
+When the request body has `"stream": true`, the proxy opens a streaming upstream
+POST (`httpx.stream`) and relays the raw SSE byte stream to the client
+chunk-by-chunk via a `StreamingResponse` — without buffering the whole body and
+without re-parsing, so `event:` / `data:` framing is preserved byte-for-byte.
+The non-streaming path is unchanged (buffered).
+
+### Cache-prefix stabilization
+
+With `cache_prefix_stable` on (default), each message is compressed **in
+isolation**, so a message's compressed bytes depend only on its own content —
+never on its position or neighbours. Across turns the shared conversation prefix
+therefore compresses to identical bytes, so provider KV/prompt caches keep
+hitting; only the new tail content changes. Optionally
+(`anthropic_cache_breakpoint`), an Anthropic request gets a single
+`cache_control: {type: ephemeral}` marker placed on the last prefix message — at
+the same stable boundary — and is left alone if the client already set one.
 
 ## Development
 
@@ -71,11 +91,11 @@ network**.
 
 ## Roadmap (deferred / open issues)
 
-- SSE streaming passthrough (`#6`)
-- Cache-prefix stabilization for KV/prompt-cache hits (`#7`)
 - OpenAI `/v1/responses` (`#5`)
 - AWS Bedrock (SigV4) (`#8`) and Google Vertex (ADC) (`#9`)
 - `tokenslim wrap <agent>` launcher (`#10`)
+
+Done: SSE streaming passthrough (`#6`), cache-prefix stabilization (`#7`).
 
 ## License
 

@@ -1,14 +1,14 @@
 """FastAPI application: compress chat bodies, forward to the real upstream.
 
-Routes (P0 foundation):
-    POST /v1/messages           -> Anthropic, compressed
-    POST /v1/chat/completions   -> OpenAI, compressed
+Routes:
+    POST /v1/messages           -> Anthropic, compressed (streams when stream=true)
+    POST /v1/chat/completions   -> OpenAI, compressed (streams when stream=true)
     GET  /healthz               -> liveness
     GET  /healthz/upstream      -> upstream config readiness
     GET  /metrics               -> Prometheus text exposition
 
-Deferred to later milestones (issues left open): SSE streaming passthrough,
-cache-prefix stabilization, /v1/responses, Bedrock, Vertex, and `wrap`.
+M2 adds SSE streaming passthrough and cache-prefix stabilization. Deferred
+(issues left open): /v1/responses, Bedrock, Vertex, and `wrap`.
 """
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
+from .cache import add_anthropic_cache_breakpoint
 from .compression import compress_messages_body
 from .config import ProxyConfig
 from .metrics import Metrics
@@ -65,8 +67,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             app.state.client = httpx.AsyncClient(timeout=cfg.upstream_timeout)
         return app.state.client
 
-    async def _proxy_chat(request: Request, *, upstream_base: str, path: str) -> Response:
-        """Shared body: read JSON, compress messages, forward, relay response."""
+    async def _proxy_chat(
+        request: Request, *, upstream_base: str, path: str, anthropic: bool = False
+    ) -> Response:
+        """Shared body: read JSON, compress messages, forward, relay response.
+
+        Streams the upstream response chunk-by-chunk when the client requested
+        ``"stream": true``; otherwise buffers and returns it whole.
+        """
         raw = await request.body()
         try:
             body: dict[str, Any] = json.loads(raw) if raw else {}
@@ -75,15 +83,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if not isinstance(body, dict):
             return _json_error(400, "Request body must be a JSON object.")
 
-        outcome = compress_messages_body(body, enabled=cfg.compression_enabled)
+        outcome = compress_messages_body(
+            body,
+            enabled=cfg.compression_enabled,
+            stable_prefix=cfg.cache_prefix_stable,
+        )
         metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
 
-        forward_body = json.dumps(outcome.body).encode("utf-8")
+        out_body = outcome.body
+        if anthropic and cfg.anthropic_cache_breakpoint:
+            out_body = add_anthropic_cache_breakpoint(out_body)
+
+        forward_body = json.dumps(out_body).encode("utf-8")
         headers = filter_request_headers(request.headers)
         headers["content-type"] = "application/json"
 
         client = _get_client()
         url = f"{upstream_base}{path}"
+        wants_stream = bool(body.get("stream"))
+
+        if wants_stream:
+            return await _stream_upstream(client, url, forward_body, headers)
+
         try:
             upstream = await client.post(url, content=forward_body, headers=headers)
         except httpx.RequestError as exc:
@@ -96,10 +117,43 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             media_type=upstream.headers.get("content-type"),
         )
 
+    async def _stream_upstream(
+        client: httpx.AsyncClient, url: str, forward_body: bytes, headers: dict[str, str]
+    ) -> Response:
+        """Open a streaming upstream POST and relay raw bytes as they arrive.
+
+        The SSE event stream is forwarded verbatim chunk-by-chunk (no buffering
+        of the whole body and no re-parsing), so ``event:`` / ``data:`` framing
+        is preserved byte-for-byte. The upstream context stays open for the life
+        of the generator and is closed when the client stream ends.
+        """
+        cm = client.stream("POST", url, content=forward_body, headers=headers)
+        try:
+            upstream = await cm.__aenter__()
+        except httpx.RequestError as exc:
+            return _json_error(502, f"Upstream request failed: {exc}")
+
+        async def body_iter() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in upstream.aiter_raw():
+                    if chunk:
+                        yield chunk
+            finally:
+                await cm.__aexit__(None, None, None)
+
+        return StreamingResponse(
+            body_iter(),
+            status_code=upstream.status_code,
+            headers=filter_response_headers(upstream.headers),
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
+
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request) -> Response:  # noqa: D401
         """Anthropic /v1/messages — compress and forward to api.anthropic.com."""
-        return await _proxy_chat(request, upstream_base=cfg.anthropic_base, path="/v1/messages")
+        return await _proxy_chat(
+            request, upstream_base=cfg.anthropic_base, path="/v1/messages", anthropic=True
+        )
 
     @app.post("/v1/chat/completions")
     async def openai_chat(request: Request) -> Response:  # noqa: D401
@@ -121,6 +175,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "anthropic_base": cfg.anthropic_base,
             "openai_base": cfg.openai_base,
             "compression_enabled": cfg.compression_enabled,
+            "cache_prefix_stable": cfg.cache_prefix_stable,
+            "anthropic_cache_breakpoint": cfg.anthropic_cache_breakpoint,
         }
 
     @app.get("/metrics")
