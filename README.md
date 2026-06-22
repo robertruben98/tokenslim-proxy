@@ -14,6 +14,7 @@ Built on **FastAPI + httpx**.
 | --- | --- | --- |
 | `POST` | `/v1/messages` | Compress + forward to `api.anthropic.com` (streams when `stream:true`). |
 | `POST` | `/v1/chat/completions` | Compress + forward to `api.openai.com` (streams when `stream:true`). |
+| `POST` | `/v1/responses` | Compress the Responses-API `input` + forward to `api.openai.com` (streams when `stream:true`). |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/healthz/upstream` | Resolved upstream config (no network call). |
 | `GET` | `/metrics` | Prometheus text exposition of compression counters. |
@@ -37,6 +38,21 @@ or Anthropic:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 ```
 
+### Wrap a coding agent
+
+`tokenslim wrap <agent>` sets the right base-URL env vars for a coding agent and
+execs its binary so its API calls route through the proxy — no per-agent config:
+
+```bash
+tokenslim wrap claude            # runs `claude` with ANTHROPIC_BASE_URL → proxy
+tokenslim wrap codex             # OPENAI_BASE_URL / OPENAI_API_BASE → proxy
+tokenslim wrap aider --model gpt-4o   # extra args pass through verbatim
+```
+
+Supported agents: `claude`, `codex`, `cursor`, `aider`, `copilot`. Your API
+keys stay in the environment untouched (the proxy forwards them upstream). If
+the agent's binary isn't on `PATH`, `wrap` fails with a clear install hint.
+
 ## Configuration (env)
 
 | Variable | Default | Description |
@@ -58,6 +74,18 @@ request the proxy parses the JSON body, runs that array through the core
 all headers except hop-by-hop / length / encoding ones, so `authorization`,
 `x-api-key` and `anthropic-version` are preserved. Non-`messages` fields (model,
 tools, system, temperature…) are passed through untouched.
+
+### Responses API (`/v1/responses`)
+
+The Responses API has no `messages` array; its prompt lives under `input`,
+either a string or a list of *items*. The proxy iterates the items and
+compresses the text it finds — typed content blocks (`input_text` /
+`output_text` / `text`) and the `output` of a `function_call_output` — bridging
+each payload into the core's text shape and writing the compressed text back
+into the original item shape (so an `input_text` block stays `input_text`).
+Items the core can't help with (`reasoning`, `function_call`, item refs…) and
+all non-`input` fields are forwarded untouched. Each text payload is compressed
+in isolation, so the same cache-prefix stability applies as for chat.
 
 ### Streaming (SSE)
 
@@ -91,11 +119,10 @@ network**.
 
 ## Roadmap (deferred / open issues)
 
-- OpenAI `/v1/responses` (`#5`)
 - AWS Bedrock (SigV4) (`#8`) and Google Vertex (ADC) (`#9`)
-- `tokenslim wrap <agent>` launcher (`#10`)
 
-Done: SSE streaming passthrough (`#6`), cache-prefix stabilization (`#7`).
+Done: SSE streaming passthrough (`#6`), cache-prefix stabilization (`#7`),
+OpenAI `/v1/responses` (`#5`), `tokenslim wrap <agent>` launcher (`#10`).
 
 ## License
 
