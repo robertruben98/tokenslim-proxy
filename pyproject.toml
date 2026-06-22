@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 tokenslim-proxy = "tokenslim_proxy.__main__:main"
+tokenslim = "tokenslim_proxy.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/robertruben98/tokenslim-proxy"
