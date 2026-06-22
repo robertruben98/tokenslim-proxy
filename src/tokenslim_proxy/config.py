@@ -28,6 +28,16 @@ class ProxyConfig:
         upstream_timeout: Per-request timeout (seconds) for upstream calls.
         compression_enabled: Master switch; when off the proxy still forwards
             but does not rewrite bodies (useful for A/B and debugging).
+        cache_prefix_stable: When ``True`` (default) each message is compressed
+            in isolation so a message's compressed bytes never depend on its
+            neighbours or position. This keeps the already-sent conversation
+            prefix byte-identical turn-to-turn, so provider KV/prompt caches
+            keep hitting. When ``False`` the whole array is compressed in one
+            pass (M0 behaviour).
+        anthropic_cache_breakpoint: When ``True``, mark the last prefix message
+            of an Anthropic ``/v1/messages`` body with a ``cache_control``
+            breakpoint at a stable boundary so the provider caches the prefix.
+            Off by default (opt-in, since it consumes a cache-control slot).
     """
 
     host: str = "127.0.0.1"
@@ -36,6 +46,8 @@ class ProxyConfig:
     openai_base: str = DEFAULT_OPENAI_BASE
     upstream_timeout: float = 60.0
     compression_enabled: bool = True
+    cache_prefix_stable: bool = True
+    anthropic_cache_breakpoint: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> ProxyConfig:
@@ -53,6 +65,12 @@ class ProxyConfig:
             ),
             compression_enabled=_parse_bool(
                 e.get("TOKENSLIM_PROXY_COMPRESSION", "1"), default=True
+            ),
+            cache_prefix_stable=_parse_bool(
+                e.get("TOKENSLIM_PROXY_CACHE_PREFIX_STABLE", "1"), default=True
+            ),
+            anthropic_cache_breakpoint=_parse_bool(
+                e.get("TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT", "0"), default=False
             ),
         )
 
