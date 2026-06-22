@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tokenslim-proxy"
+version = "0.0.1"
+description = "OpenAI/Anthropic-compatible HTTP proxy that transparently compresses LLM context via the tokenslim core. Zero client code changes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "robertruben98" }]
+keywords = ["llm", "proxy", "context", "compression", "openai", "anthropic", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "uvicorn[standard]>=0.29",
+    "tokenslim @ git+https://github.com/robertruben98/tokenslim",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+tokenslim-proxy = "tokenslim_proxy.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/robertruben98/tokenslim-proxy"
+Repository = "https://github.com/robertruben98/tokenslim-proxy"
+Issues = "https://github.com/robertruben98/tokenslim-proxy/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tokenslim_proxy"]
+
+[tool.hatch.metadata]
+# Allow the direct git reference for the tokenslim core dependency.
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
