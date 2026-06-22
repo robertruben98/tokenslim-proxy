@@ -70,13 +70,13 @@ async def test_anthropic_messages_forwards_compressed_body_to_anthropic(app):
     assert sent.headers["x-api-key"] == "sk-ant-test"
     assert sent.headers["anthropic-version"] == "2023-06-01"
 
-    # (a) forwarded body is compressed: still valid + same data, fewer bytes.
+    # (a) forwarded body is compressed: smaller and still valid JSON.
     forwarded = json.loads(sent.content)
     big_in = request_body["messages"][1]["content"]
     big_out = forwarded["messages"][1]["content"]
     assert len(big_out) < len(big_in)
-    assert json.loads(big_out) == json.loads(big_in)
-    assert "\n" not in big_out  # whitespace stripped
+    assert json.loads(big_out) is not None
+    assert "__tokenslim_ccr__" in big_out  # CCR elision marker present
     # Non-message fields are forwarded untouched.
     assert forwarded["model"] == "claude-sonnet-4-6"
     assert forwarded["max_tokens"] == 1024
@@ -114,8 +114,11 @@ async def test_openai_chat_forwards_to_openai_host(app):
     forwarded = json.loads(sent.content)
     tool_in = request_body["messages"][1]["content"]
     tool_out = forwarded["messages"][1]["content"]
+    # Smaller, still valid JSON. (The core now elides via a CCR marker rather
+    # than byte-exact minify, so the output no longer equals the input.)
     assert len(tool_out) < len(tool_in)
-    assert json.loads(tool_out) == json.loads(tool_in)
+    assert json.loads(tool_out) is not None
+    assert "__tokenslim_ccr__" in tool_out
 
 
 @respx.mock

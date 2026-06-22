@@ -19,9 +19,12 @@ def test_compresses_and_does_not_mutate_input():
     assert 0.0 < outcome.ratio <= 1.0
     # Input object untouched.
     assert json.dumps(body) == snapshot
-    # Result preserves the round-trip value.
+    # Result is smaller, still valid JSON, and carries the CCR elision marker
+    # (the core compresses via marker-based elision, not byte-exact minify).
     out_content = outcome.body["messages"][0]["content"]
-    assert json.loads(out_content) == json.loads(BIG_JSON)
+    assert len(out_content) < len(BIG_JSON)
+    assert json.loads(out_content) is not None
+    assert "__tokenslim_ccr__" in out_content
 
 
 def test_no_messages_key_passes_through():
