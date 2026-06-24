@@ -90,7 +90,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         other client headers are preserved by :func:`filter_request_headers`.
         """
         forward_body = json.dumps(out_body).encode("utf-8")
-        headers = filter_request_headers(request.headers)
+        headers = filter_request_headers(dict(request.headers))
         headers["content-type"] = "application/json"
 
         client = _get_client()

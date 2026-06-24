@@ -128,6 +128,7 @@ def compress_responses_body(body: dict[str, Any], *, enabled: bool = True) -> Re
     """
     raw_input = body.get("input")
 
+    new_input: str | list[Any]
     if isinstance(raw_input, str):
         new_input, orig_tokens, new_tokens = _compress_text(raw_input, enabled=enabled)
     elif isinstance(raw_input, list) and raw_input:
