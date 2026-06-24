@@ -68,7 +68,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return app.state.client
 
     async def _proxy_chat(
-        request: Request, *, upstream_base: str, path: str, anthropic: bool = False
+        request: Request,
+        *,
+        upstream_base: str,
+        path: str,
+        anthropic: bool = False,
+        responses: bool = False,
     ) -> Response:
         """Shared body: read JSON, compress messages, forward, relay response.
 
@@ -83,11 +88,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if not isinstance(body, dict):
             return _json_error(400, "Request body must be a JSON object.")
 
-        outcome = compress_messages_body(
-            body,
-            enabled=cfg.compression_enabled,
-            stable_prefix=cfg.cache_prefix_stable,
-        )
+        if responses:
+            from .compression import compress_responses_body
+
+            outcome = compress_responses_body(
+                body,
+                enabled=cfg.compression_enabled,
+                stable_prefix=cfg.cache_prefix_stable,
+            )
+        else:
+            outcome = compress_messages_body(
+                body,
+                enabled=cfg.compression_enabled,
+                stable_prefix=cfg.cache_prefix_stable,
+            )
         metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
 
         out_body = outcome.body
@@ -95,7 +109,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             out_body = add_anthropic_cache_breakpoint(out_body)
 
         forward_body = json.dumps(out_body).encode("utf-8")
-        headers = filter_request_headers(request.headers)
+        headers = filter_request_headers(dict(request.headers))
         headers["content-type"] = "application/json"
 
         client = _get_client()
@@ -160,6 +174,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """OpenAI /v1/chat/completions — compress and forward to api.openai.com."""
         return await _proxy_chat(
             request, upstream_base=cfg.openai_base, path="/v1/chat/completions"
+        )
+
+    @app.post("/v1/responses")
+    async def openai_responses(request: Request) -> Response:  # noqa: D401
+        """OpenAI /v1/responses — compress inputs and forward to api.openai.com."""
+        return await _proxy_chat(
+            request, upstream_base=cfg.openai_base, path="/v1/responses", responses=True
         )
 
     @app.get("/healthz")
