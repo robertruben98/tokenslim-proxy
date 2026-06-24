@@ -196,3 +196,46 @@ async def test_compression_disabled_forwards_verbatim(config, disabled_app_messa
     forwarded = json.loads(route.calls.last.request.content)
     # Verbatim: the big block is unchanged when compression is off.
     assert forwarded["messages"][0]["content"] == BIG_JSON
+
+
+@respx.mock
+async def test_openai_responses_compression(app):
+    respx.routes.clear()
+    route = respx.post("https://openai.test/v1/responses").mock(
+        return_value=httpx.Response(200, json={"id": "resp_1", "object": "response"})
+    )
+
+    request_body = {
+        "model": "gpt-4o",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": BIG_JSON,
+                    }
+                ]
+            }
+        ]
+    }
+
+    async with _asgi_client(app) as client:
+        resp = await client.post(
+            "/v1/responses",
+            json=request_body,
+            headers={"authorization": "Bearer sk-openai-test"},
+        )
+
+    assert resp.status_code == 200
+    assert route.called
+    sent = route.calls.last.request
+    assert str(sent.url) == "https://openai.test/v1/responses"
+    assert sent.headers["authorization"] == "Bearer sk-openai-test"
+
+    forwarded = json.loads(sent.content)
+    input_item_out = forwarded["input"][0]["content"][0]["text"]
+    assert len(input_item_out) < len(BIG_JSON)
+    assert json.loads(input_item_out) is not None
+    assert "__tokenslim_ccr__" in input_item_out
+

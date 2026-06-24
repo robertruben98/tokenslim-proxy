@@ -91,3 +91,82 @@ def compress_messages_body(
         ratio=ratio,
         changed=changed,
     )
+
+
+def _responses_to_chat_messages(input_items: list[Any]) -> list[Any]:
+    chat_msgs = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            chat_msgs.append(item)
+            continue
+        new_item = dict(item)
+        content = item.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "input_text":
+                    new_block = dict(block)
+                    new_block["type"] = "text"
+                    new_content.append(new_block)
+                else:
+                    new_content.append(block)
+            new_item["content"] = new_content
+        chat_msgs.append(new_item)
+    return chat_msgs
+
+
+def _chat_messages_to_responses(chat_msgs: list[Any]) -> list[Any]:
+    input_items = []
+    for item in chat_msgs:
+        if not isinstance(item, dict):
+            input_items.append(item)
+            continue
+        new_item = dict(item)
+        content = item.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                    new_block = dict(block)
+                    new_block["type"] = "input_text"
+                    new_content.append(new_block)
+                else:
+                    new_content.append(block)
+            new_item["content"] = new_content
+        input_items.append(new_item)
+    return input_items
+
+
+def compress_responses_body(
+    body: dict[str, Any], *, enabled: bool = True, stable_prefix: bool = True
+) -> CompressionOutcome:
+    """Compress the ``input`` array of a responses-style request body."""
+    input_items = body.get("input")
+    if not isinstance(input_items, list) or not input_items:
+        return CompressionOutcome(body=body, orig_tokens=0, new_tokens=0, ratio=0.0, changed=False)
+
+    chat_msgs = _responses_to_chat_messages(input_items)
+
+    if not enabled:
+        new_messages, stats = _core_compress(chat_msgs, enabled=False)
+        orig_tokens, new_tokens = stats.orig_tokens, stats.new_tokens
+    elif stable_prefix:
+        new_messages, orig_tokens, new_tokens = _compress_stable(chat_msgs)
+    else:
+        new_messages, stats = _core_compress(chat_msgs)
+        orig_tokens, new_tokens = stats.orig_tokens, stats.new_tokens
+
+    new_input = _chat_messages_to_responses(new_messages)
+
+    new_body = dict(body)
+    new_body["input"] = new_input
+
+    ratio = 0.0 if orig_tokens <= 0 else 1.0 - (new_tokens / orig_tokens)
+    changed = new_tokens < orig_tokens
+    return CompressionOutcome(
+        body=new_body,
+        orig_tokens=orig_tokens,
+        new_tokens=new_tokens,
+        ratio=ratio,
+        changed=changed,
+    )
