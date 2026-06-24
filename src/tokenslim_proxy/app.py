@@ -3,12 +3,13 @@
 Routes:
     POST /v1/messages           -> Anthropic, compressed (streams when stream=true)
     POST /v1/chat/completions   -> OpenAI, compressed (streams when stream=true)
+    POST /v1/responses          -> OpenAI Responses API, compressed (streams too)
     GET  /healthz               -> liveness
     GET  /healthz/upstream      -> upstream config readiness
     GET  /metrics               -> Prometheus text exposition
 
 M2 adds SSE streaming passthrough and cache-prefix stabilization. Deferred
-(issues left open): /v1/responses, Bedrock, Vertex, and `wrap`.
+(issues left open): Bedrock and Vertex native routes.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from .cache import add_anthropic_cache_breakpoint
 from .compression import compress_messages_body
 from .config import ProxyConfig
 from .metrics import Metrics
+from .responses import compress_responses_body
 from .upstream import filter_request_headers, filter_response_headers
 
 
@@ -67,56 +69,34 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             app.state.client = httpx.AsyncClient(timeout=cfg.upstream_timeout)
         return app.state.client
 
-    async def _proxy_chat(
-        request: Request,
-        *,
-        upstream_base: str,
-        path: str,
-        anthropic: bool = False,
-        responses: bool = False,
-    ) -> Response:
-        """Shared body: read JSON, compress messages, forward, relay response.
-
-        Streams the upstream response chunk-by-chunk when the client requested
-        ``"stream": true``; otherwise buffers and returns it whole.
-        """
+    async def _read_body(request: Request) -> dict[str, Any] | Response:
+        """Parse the JSON request body, or return a 400 ``Response`` on error."""
         raw = await request.body()
         try:
-            body: dict[str, Any] = json.loads(raw) if raw else {}
+            body: Any = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             return _json_error(400, "Request body is not valid JSON.")
         if not isinstance(body, dict):
             return _json_error(400, "Request body must be a JSON object.")
+        return body
 
-        if responses:
-            from .compression import compress_responses_body
+    async def _forward(
+        request: Request, *, out_body: dict[str, Any], upstream_base: str, path: str
+    ) -> Response:
+        """Forward a (compressed) body to ``upstream_base + path``.
 
-            outcome = compress_responses_body(
-                body,
-                enabled=cfg.compression_enabled,
-                stable_prefix=cfg.cache_prefix_stable,
-            )
-        else:
-            outcome = compress_messages_body(
-                body,
-                enabled=cfg.compression_enabled,
-                stable_prefix=cfg.cache_prefix_stable,
-            )
-        metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
-
-        out_body = outcome.body
-        if anthropic and cfg.anthropic_cache_breakpoint:
-            out_body = add_anthropic_cache_breakpoint(out_body)
-
+        Streams the upstream response chunk-by-chunk when the client requested
+        ``"stream": true``; otherwise buffers and returns it whole. Auth and
+        other client headers are preserved by :func:`filter_request_headers`.
+        """
         forward_body = json.dumps(out_body).encode("utf-8")
         headers = filter_request_headers(dict(request.headers))
         headers["content-type"] = "application/json"
 
         client = _get_client()
         url = f"{upstream_base}{path}"
-        wants_stream = bool(body.get("stream"))
 
-        if wants_stream:
+        if bool(out_body.get("stream")):
             return await _stream_upstream(client, url, forward_body, headers)
 
         try:
@@ -129,6 +109,43 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             status_code=upstream.status_code,
             headers=filter_response_headers(upstream.headers),
             media_type=upstream.headers.get("content-type"),
+        )
+
+    async def _proxy_chat(
+        request: Request, *, upstream_base: str, path: str, anthropic: bool = False
+    ) -> Response:
+        """Read JSON, compress the ``messages`` array, forward, relay response."""
+        body = await _read_body(request)
+        if isinstance(body, Response):
+            return body
+
+        outcome = compress_messages_body(
+            body,
+            enabled=cfg.compression_enabled,
+            stable_prefix=cfg.cache_prefix_stable,
+        )
+        metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
+
+        out_body = outcome.body
+        if anthropic and cfg.anthropic_cache_breakpoint:
+            out_body = add_anthropic_cache_breakpoint(out_body)
+
+        return await _forward(request, out_body=out_body, upstream_base=upstream_base, path=path)
+
+    async def _proxy_responses(request: Request) -> Response:
+        """Read JSON, compress the Responses-API ``input``, forward, relay."""
+        body = await _read_body(request)
+        if isinstance(body, Response):
+            return body
+
+        outcome = compress_responses_body(body, enabled=cfg.compression_enabled)
+        metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
+
+        return await _forward(
+            request,
+            out_body=outcome.body,
+            upstream_base=cfg.openai_base,
+            path="/v1/responses",
         )
 
     async def _stream_upstream(
@@ -178,10 +195,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.post("/v1/responses")
     async def openai_responses(request: Request) -> Response:  # noqa: D401
-        """OpenAI /v1/responses — compress inputs and forward to api.openai.com."""
-        return await _proxy_chat(
-            request, upstream_base=cfg.openai_base, path="/v1/responses", responses=True
-        )
+        """OpenAI /v1/responses — compress the ``input`` and forward to OpenAI."""
+        return await _proxy_responses(request)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
