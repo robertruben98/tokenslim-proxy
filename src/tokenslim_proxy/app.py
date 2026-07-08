@@ -4,12 +4,14 @@ Routes:
     POST /v1/messages           -> Anthropic, compressed (streams when stream=true)
     POST /v1/chat/completions   -> OpenAI, compressed (streams when stream=true)
     POST /v1/responses          -> OpenAI Responses API, compressed (streams too)
+    POST /model/{id}/invoke[-with-response-stream]
+                                -> AWS Bedrock, compressed + SigV4-signed
     GET  /healthz               -> liveness
     GET  /healthz/upstream      -> upstream config readiness
     GET  /metrics               -> Prometheus text exposition
 
-M2 adds SSE streaming passthrough and cache-prefix stabilization. Deferred
-(issues left open): Bedrock and Vertex native routes.
+M2 adds SSE streaming passthrough and cache-prefix stabilization; the native
+Bedrock route (SigV4) lands here too. Deferred (issue left open): Vertex.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from .compression import compress_messages_body
 from .config import ProxyConfig
 from .metrics import Metrics
 from .responses import compress_responses_body
+from .sigv4 import AwsCredentials, sign_request
 from .upstream import filter_request_headers, filter_response_headers
 
 
@@ -80,23 +83,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             return _json_error(400, "Request body must be a JSON object.")
         return body
 
-    async def _forward(
-        request: Request, *, out_body: dict[str, Any], upstream_base: str, path: str
+    async def _send_upstream(
+        url: str, forward_body: bytes, headers: dict[str, str], *, stream: bool
     ) -> Response:
-        """Forward a (compressed) body to ``upstream_base + path``.
+        """POST a prepared body upstream and relay the reply.
 
-        Streams the upstream response chunk-by-chunk when the client requested
-        ``"stream": true``; otherwise buffers and returns it whole. Auth and
-        other client headers are preserved by :func:`filter_request_headers`.
+        Streams the response chunk-by-chunk when ``stream`` is set (raw bytes, so
+        both OpenAI/Anthropic SSE and Bedrock's binary EventStream framing survive
+        intact); otherwise buffers it and returns it whole. Callers own the
+        headers, so this works for both header-relayed and SigV4-signed requests.
         """
-        forward_body = json.dumps(out_body).encode("utf-8")
-        headers = filter_request_headers(dict(request.headers))
-        headers["content-type"] = "application/json"
-
         client = _get_client()
-        url = f"{upstream_base}{path}"
-
-        if bool(out_body.get("stream")):
+        if stream:
             return await _stream_upstream(client, url, forward_body, headers)
 
         try:
@@ -109,6 +107,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             status_code=upstream.status_code,
             headers=filter_response_headers(upstream.headers),
             media_type=upstream.headers.get("content-type"),
+        )
+
+    async def _forward(
+        request: Request, *, out_body: dict[str, Any], upstream_base: str, path: str
+    ) -> Response:
+        """Forward a (compressed) body to ``upstream_base + path``.
+
+        Streams the upstream response chunk-by-chunk when the client requested
+        ``"stream": true``; otherwise buffers and returns it whole. Auth and
+        other client headers are preserved by :func:`filter_request_headers`.
+        """
+        forward_body = json.dumps(out_body).encode("utf-8")
+        headers = filter_request_headers(dict(request.headers))
+        headers["content-type"] = "application/json"
+        return await _send_upstream(
+            f"{upstream_base}{path}", forward_body, headers, stream=bool(out_body.get("stream"))
         )
 
     async def _proxy_chat(
@@ -147,6 +161,49 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             upstream_base=cfg.openai_base,
             path="/v1/responses",
         )
+
+    async def _proxy_bedrock(request: Request, *, model_id: str, stream: bool) -> Response:
+        """Compress an Anthropic-on-Bedrock body, SigV4-sign it, forward to Bedrock.
+
+        Bedrock's ``InvokeModel`` body carries the same ``messages`` array as
+        ``/v1/messages`` (the model id lives in the URL, not the body), so the
+        same compression applies. Unlike the header-relaying routes, Bedrock
+        authenticates with SigV4, so the proxy holds the AWS credentials and
+        signs the **compressed** body itself (the client sends no auth header).
+        ``stream`` selects the ``invoke-with-response-stream`` action and relays
+        Bedrock's binary EventStream response verbatim.
+        """
+        body = await _read_body(request)
+        if isinstance(body, Response):
+            return body
+
+        credentials = AwsCredentials.from_env()
+        if credentials is None:
+            return _json_error(
+                500,
+                "AWS credentials not configured "
+                "(set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY).",
+            )
+
+        outcome = compress_messages_body(
+            body, enabled=cfg.compression_enabled, stable_prefix=cfg.cache_prefix_stable
+        )
+        metrics.record(orig=outcome.orig_tokens, new=outcome.new_tokens)
+
+        forward_body = json.dumps(outcome.body).encode("utf-8")
+        action = "invoke-with-response-stream" if stream else "invoke"
+        url = f"{cfg.bedrock_endpoint()}/model/{model_id}/{action}"
+        accept = "application/vnd.amazon.eventstream" if stream else "application/json"
+        headers = sign_request(
+            method="POST",
+            url=url,
+            payload=forward_body,
+            region=cfg.aws_region,
+            service="bedrock",
+            credentials=credentials,
+            headers={"content-type": "application/json", "accept": accept},
+        )
+        return await _send_upstream(url, forward_body, headers, stream=stream)
 
     async def _stream_upstream(
         client: httpx.AsyncClient, url: str, forward_body: bytes, headers: dict[str, str]
@@ -198,6 +255,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """OpenAI /v1/responses — compress the ``input`` and forward to OpenAI."""
         return await _proxy_responses(request)
 
+    @app.post("/model/{model_id:path}/invoke")
+    async def bedrock_invoke(model_id: str, request: Request) -> Response:  # noqa: D401
+        """Bedrock InvokeModel — compress, SigV4-sign, forward (buffered)."""
+        return await _proxy_bedrock(request, model_id=model_id, stream=False)
+
+    @app.post("/model/{model_id:path}/invoke-with-response-stream")
+    async def bedrock_invoke_stream(model_id: str, request: Request) -> Response:  # noqa: D401
+        """Bedrock InvokeModelWithResponseStream — compress, sign, relay EventStream."""
+        return await _proxy_bedrock(request, model_id=model_id, stream=True)
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         """Liveness probe."""
@@ -210,6 +277,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "status": "ok",
             "anthropic_base": cfg.anthropic_base,
             "openai_base": cfg.openai_base,
+            "bedrock_base": cfg.bedrock_endpoint(),
+            "aws_region": cfg.aws_region,
             "compression_enabled": cfg.compression_enabled,
             "cache_prefix_stable": cfg.cache_prefix_stable,
             "anthropic_cache_breakpoint": cfg.anthropic_cache_breakpoint,
