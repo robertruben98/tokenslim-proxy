@@ -9,6 +9,7 @@ from dataclasses import dataclass
 # repoint the proxy without touching code.
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 DEFAULT_OPENAI_BASE = "https://api.openai.com"
+DEFAULT_AWS_REGION = "us-east-1"
 
 
 def _clean_base(url: str) -> str:
@@ -38,6 +39,11 @@ class ProxyConfig:
             of an Anthropic ``/v1/messages`` body with a ``cache_control``
             breakpoint at a stable boundary so the provider caches the prefix.
             Off by default (opt-in, since it consumes a cache-control slot).
+        aws_region: AWS region for the Bedrock route's SigV4 signing and (unless
+            ``bedrock_base`` is set) the default runtime endpoint.
+        bedrock_base: Upstream base URL for Bedrock requests. Empty (default)
+            means derive it from ``aws_region`` via :meth:`bedrock_endpoint`;
+            overridable so tests / VPC endpoints can repoint the proxy.
     """
 
     host: str = "127.0.0.1"
@@ -48,6 +54,16 @@ class ProxyConfig:
     compression_enabled: bool = True
     cache_prefix_stable: bool = True
     anthropic_cache_breakpoint: bool = False
+    aws_region: str = DEFAULT_AWS_REGION
+    bedrock_base: str = ""
+
+    def bedrock_endpoint(self) -> str:
+        """Resolve the Bedrock runtime base URL.
+
+        Uses the explicit ``bedrock_base`` override when set, otherwise the
+        regional default ``https://bedrock-runtime.<region>.amazonaws.com``.
+        """
+        return self.bedrock_base or f"https://bedrock-runtime.{self.aws_region}.amazonaws.com"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> ProxyConfig:
@@ -72,6 +88,8 @@ class ProxyConfig:
             anthropic_cache_breakpoint=_parse_bool(
                 e.get("TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT", "0"), default=False
             ),
+            aws_region=e.get("TOKENSLIM_PROXY_AWS_REGION", DEFAULT_AWS_REGION),
+            bedrock_base=_clean_base(e.get("TOKENSLIM_PROXY_BEDROCK_BASE", "")),
         )
 
 

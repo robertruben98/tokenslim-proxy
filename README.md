@@ -15,6 +15,8 @@ Built on **FastAPI + httpx**.
 | `POST` | `/v1/messages` | Compress + forward to `api.anthropic.com` (streams when `stream:true`). |
 | `POST` | `/v1/chat/completions` | Compress + forward to `api.openai.com` (streams when `stream:true`). |
 | `POST` | `/v1/responses` | Compress the Responses-API `input` + forward to `api.openai.com` (streams when `stream:true`). |
+| `POST` | `/model/{modelId}/invoke` | Compress + **SigV4-sign** + forward to AWS Bedrock (`bedrock-runtime.<region>`). |
+| `POST` | `/model/{modelId}/invoke-with-response-stream` | Same, streaming Bedrock's binary EventStream response. |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/healthz/upstream` | Resolved upstream config (no network call). |
 | `GET` | `/metrics` | Prometheus text exposition of compression counters. |
@@ -65,6 +67,11 @@ the agent's binary isn't on `PATH`, `wrap` fails with a clear install hint.
 | `TOKENSLIM_PROXY_COMPRESSION` | `1` | Master on/off switch. |
 | `TOKENSLIM_PROXY_CACHE_PREFIX_STABLE` | `1` | Compress each message in isolation so the already-sent prefix stays byte-stable across turns. |
 | `TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT` | `0` | Insert an Anthropic `cache_control` breakpoint at the prefix boundary (opt-in). |
+| `TOKENSLIM_PROXY_AWS_REGION` | `us-east-1` | AWS region for the Bedrock route (SigV4 scope + default endpoint). |
+| `TOKENSLIM_PROXY_BEDROCK_BASE` | *(derived)* | Bedrock runtime base URL; empty derives `https://bedrock-runtime.<region>.amazonaws.com`. |
+
+The Bedrock route signs with SigV4 using standard AWS credential env vars —
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`.
 
 ## How it works
 
@@ -86,6 +93,19 @@ into the original item shape (so an `input_text` block stays `input_text`).
 Items the core can't help with (`reasoning`, `function_call`, item refs…) and
 all non-`input` fields are forwarded untouched. Each text payload is compressed
 in isolation, so the same cache-prefix stability applies as for chat.
+
+### AWS Bedrock (`/model/{modelId}/invoke`)
+
+Bedrock's native `InvokeModel` API carries the same Anthropic `messages` array
+as `/v1/messages` (the model id lives in the URL, not the body), so the same
+compression applies. Unlike the header-relaying routes, Bedrock authenticates
+with **SigV4** rather than a bearer key — so the proxy holds the AWS credentials
+and signs each request itself. Because the signature covers the body, signing
+happens **after** compression, over the exact compressed bytes. The SigV4 signer
+is a self-contained stdlib implementation (no boto3), validated byte-for-byte
+against `botocore` in the tests. The streaming variant
+(`/model/{modelId}/invoke-with-response-stream`) relays Bedrock's binary
+`application/vnd.amazon.eventstream` response verbatim, chunk by chunk.
 
 ### Streaming (SSE)
 
@@ -119,10 +139,11 @@ network**.
 
 ## Roadmap (deferred / open issues)
 
-- AWS Bedrock (SigV4) (`#8`) and Google Vertex (ADC) (`#9`)
+- Google Vertex (ADC) (`#9`)
 
-Done: SSE streaming passthrough (`#6`), cache-prefix stabilization (`#7`),
-OpenAI `/v1/responses` (`#5`), `tokenslim wrap <agent>` launcher (`#10`).
+Done: AWS Bedrock native route + SigV4 (`#8`), SSE streaming passthrough (`#6`),
+cache-prefix stabilization (`#7`), OpenAI `/v1/responses` (`#5`),
+`tokenslim wrap <agent>` launcher (`#10`).
 
 ## License
 
