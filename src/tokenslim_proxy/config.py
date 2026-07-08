@@ -5,10 +5,16 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .vertex import VERTEX_ANTHROPIC_VERSION, vertex_base_url
+
 # Default upstream bases. Overridable so tests (and self-hosted gateways) can
 # repoint the proxy without touching code.
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 DEFAULT_OPENAI_BASE = "https://api.openai.com"
+
+# Default Vertex region. The aiplatform host is regional, so this also picks the
+# default endpoint base (``{location}-aiplatform.googleapis.com``).
+DEFAULT_VERTEX_LOCATION = "us-east5"
 
 
 def _clean_base(url: str) -> str:
@@ -38,6 +44,15 @@ class ProxyConfig:
             of an Anthropic ``/v1/messages`` body with a ``cache_control``
             breakpoint at a stable boundary so the provider caches the prefix.
             Off by default (opt-in, since it consumes a cache-control slot).
+        vertex_project: GCP project id for the Vertex route. ``None`` (unset)
+            leaves ``/v1/vertex/messages`` disabled (it returns a 500 with a
+            configuration hint).
+        vertex_location: Vertex region; also selects the regional endpoint host
+            unless ``vertex_base`` overrides it.
+        vertex_base: Explicit Vertex ``aiplatform`` base URL override (mainly
+            for tests). Empty means derive it from ``vertex_location``.
+        vertex_anthropic_version: ``anthropic_version`` value injected into
+            Vertex bodies that don't already set one.
     """
 
     host: str = "127.0.0.1"
@@ -48,6 +63,15 @@ class ProxyConfig:
     compression_enabled: bool = True
     cache_prefix_stable: bool = True
     anthropic_cache_breakpoint: bool = False
+    vertex_project: str | None = None
+    vertex_location: str = DEFAULT_VERTEX_LOCATION
+    vertex_base: str = ""
+    vertex_anthropic_version: str = VERTEX_ANTHROPIC_VERSION
+
+    @property
+    def vertex_endpoint_base(self) -> str:
+        """Resolved Vertex base URL: explicit override, else region-derived."""
+        return self.vertex_base or vertex_base_url(self.vertex_location)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> ProxyConfig:
@@ -71,6 +95,12 @@ class ProxyConfig:
             ),
             anthropic_cache_breakpoint=_parse_bool(
                 e.get("TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT", "0"), default=False
+            ),
+            vertex_project=e.get("TOKENSLIM_PROXY_VERTEX_PROJECT") or None,
+            vertex_location=e.get("TOKENSLIM_PROXY_VERTEX_LOCATION", DEFAULT_VERTEX_LOCATION),
+            vertex_base=_clean_base(e.get("TOKENSLIM_PROXY_VERTEX_BASE", "")),
+            vertex_anthropic_version=e.get(
+                "TOKENSLIM_PROXY_VERTEX_ANTHROPIC_VERSION", VERTEX_ANTHROPIC_VERSION
             ),
         )
 

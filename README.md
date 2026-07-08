@@ -15,6 +15,7 @@ Built on **FastAPI + httpx**.
 | `POST` | `/v1/messages` | Compress + forward to `api.anthropic.com` (streams when `stream:true`). |
 | `POST` | `/v1/chat/completions` | Compress + forward to `api.openai.com` (streams when `stream:true`). |
 | `POST` | `/v1/responses` | Compress the Responses-API `input` + forward to `api.openai.com` (streams when `stream:true`). |
+| `POST` | `/v1/vertex/messages` | Compress an Anthropic-style body + forward to Vertex AI with a GCP ADC bearer token (streams when `stream:true`). |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/healthz/upstream` | Resolved upstream config (no network call). |
 | `GET` | `/metrics` | Prometheus text exposition of compression counters. |
@@ -65,6 +66,10 @@ the agent's binary isn't on `PATH`, `wrap` fails with a clear install hint.
 | `TOKENSLIM_PROXY_COMPRESSION` | `1` | Master on/off switch. |
 | `TOKENSLIM_PROXY_CACHE_PREFIX_STABLE` | `1` | Compress each message in isolation so the already-sent prefix stays byte-stable across turns. |
 | `TOKENSLIM_PROXY_ANTHROPIC_CACHE_BREAKPOINT` | `0` | Insert an Anthropic `cache_control` breakpoint at the prefix boundary (opt-in). |
+| `TOKENSLIM_PROXY_VERTEX_PROJECT` | *(unset)* | GCP project id; enables `/v1/vertex/messages`. Unset ⇒ the route returns a 500 config hint. |
+| `TOKENSLIM_PROXY_VERTEX_LOCATION` | `us-east5` | Vertex region; also selects the regional `aiplatform` host. |
+| `TOKENSLIM_PROXY_VERTEX_BASE` | *(derived)* | Override the Vertex `aiplatform` base URL (mainly for tests). |
+| `TOKENSLIM_PROXY_VERTEX_ANTHROPIC_VERSION` | `vertex-2023-10-16` | `anthropic_version` injected into Vertex bodies that omit one. |
 
 ## How it works
 
@@ -86,6 +91,26 @@ into the original item shape (so an `input_text` block stays `input_text`).
 Items the core can't help with (`reasoning`, `function_call`, item refs…) and
 all non-`input` fields are forwarded untouched. Each text payload is compressed
 in isolation, so the same cache-prefix stability applies as for chat.
+
+### Vertex AI (`/v1/vertex/messages`)
+
+Google Vertex AI serves Anthropic Claude models at a regional endpoint. Send an
+ordinary Anthropic `/v1/messages` body (including a `model`) to this route; the
+proxy compresses the `messages` exactly as the Anthropic route does, then
+rewrites the request for Vertex: it moves `model` into the URL
+(`…/publishers/anthropic/models/<model>:rawPredict`, or `:streamRawPredict` when
+`stream:true`), sets `anthropic_version` to `vertex-2023-10-16` (unless you
+supplied one), and attaches a fresh **Application Default Credentials** bearer
+token — unlike Bedrock's SigV4, the token doesn't sign the body, so
+recompressing is safe. Install the auth dependency with the `vertex` extra and
+authenticate once:
+
+```bash
+pip install -e ".[vertex]"
+gcloud auth application-default login
+export TOKENSLIM_PROXY_VERTEX_PROJECT=my-gcp-project
+export TOKENSLIM_PROXY_VERTEX_LOCATION=us-east5   # optional
+```
 
 ### Streaming (SSE)
 
@@ -119,10 +144,11 @@ network**.
 
 ## Roadmap (deferred / open issues)
 
-- AWS Bedrock (SigV4) (`#8`) and Google Vertex (ADC) (`#9`)
+- AWS Bedrock (SigV4) (`#8`)
 
 Done: SSE streaming passthrough (`#6`), cache-prefix stabilization (`#7`),
-OpenAI `/v1/responses` (`#5`), `tokenslim wrap <agent>` launcher (`#10`).
+OpenAI `/v1/responses` (`#5`), `tokenslim wrap <agent>` launcher (`#10`),
+Google Vertex (ADC) (`#9`).
 
 ## License
 
